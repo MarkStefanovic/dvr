@@ -1,0 +1,3 @@
+{
+  "connection_string": "postgres://username:password@localhost:5432/database_name"
+}
