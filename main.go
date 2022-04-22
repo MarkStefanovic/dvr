@@ -325,6 +325,8 @@ func runStoredProcedure(
 	sb.WriteString(")")
 	sql := sb.String()
 
+	log.Printf("Running %s", sql)
+
 	_, err := con.Exec(context.Background(), sql, params...)
 	if err != nil {
 		return fmt.Errorf(
