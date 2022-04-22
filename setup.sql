@@ -87,3 +87,21 @@ CREATE TABLE IF NOT EXISTS dv.s_customer_sales (
 ,   ts TIMESTAMPTZ(0) NOT NULL DEFAULT NOW()
 );
 
+CREATE OR REPLACE PROCEDURE dv.refresh_s_customer_sales (
+    p_incremental BOOLEAN DEFAULT TRUE
+,   p_dv_h_customer_ts TIMESTAMPTZ(0) DEFAULT '1900-01-01 00:00:00 +0'
+,   p_sales_customer_date_added TIMESTAMPTZ(0) DEFAULT '1900-01-01 00:00:00 +0'
+,   p_sales_customer_date_updated TIMESTAMPTZ(0) DEFAULT '1900-01-01 00:00:00 +0'
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE NOTICE 'p_incremental: %', p_incremental;
+    RAISE NOTICE 'p_dv_h_customer_ts: %', p_dv_h_customer_ts;
+    RAISE NOTICE 'p_sales_customer_date_added: %', p_sales_customer_date_added;
+    RAISE NOTICE 'p_sales_customer_date_updated: %', p_sales_customer_date_updated;
+END;
+$$;
+CALL dv.refresh_s_customer_sales();
+
+CALL dv.refresh_s_customer_sales();

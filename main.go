@@ -94,7 +94,6 @@ func main() {
 			}
 			seenTimestamps[dependency.FullName()] = ts
 		}
-		log.Printf("seenTimestamps: %v", seenTimestamps)
 
 		err = runStoredProcedure(
 			con,
@@ -105,6 +104,8 @@ func main() {
 		if err != nil {
 			log.Fatalf("An error occurred while running the stored procedure: %v", err)
 		}
+
+		log.Println("Refresh was successful.")
 
 		for _, tsField := range tsFields {
 			ts, err := getMaxTs(con, *schemaPtr, *tablePtr, tsField)
@@ -322,14 +323,15 @@ func runStoredProcedure(
 		params = append(params, dependency.Seen)
 	}
 	sb.WriteString(")")
-
 	sql := sb.String()
-	log.Println(sql)
 
-	//_, err := con.Exec(context.Background(), sql, params...)
-	//if err != nil {
-	//	return err
-	//}
+	_, err := con.Exec(context.Background(), sql, params...)
+	if err != nil {
+		return fmt.Errorf(
+			"runStoredProcedure(con: ..., schema: %s, spName: %s, dependencies: %v, %s: %v",
+			schema, spName, dependencies, sql, err,
+		)
+	}
 
 	return nil
 }
