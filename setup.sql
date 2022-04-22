@@ -104,4 +104,18 @@ END;
 $$;
 CALL dv.refresh_s_customer_sales();
 
-CALL dv.refresh_s_customer_sales();
+CREATE TABLE IF NOT EXISTS etl.sp_snapshot (
+    schema_name TEXT NOT NULL
+,   sp_name TEXT NOT NULL
+,   cmd TEXT NOT NULL
+,   incremental BOOL NOT NULL
+,   running BOOL NOT NULL
+,   failed BOOL NOT NULL
+,   skipped BOOL NOT NULL
+,   start_ts TIMESTAMPTZ(0) NOT NULL DEFAULT NOW()
+,   end_ts TIMESTAMPTZ(0) NULL
+,   error_message TEXT NOT NULL DEFAULT ''
+,   ts TIMESTAMPTZ(0) NOT NULL DEFAULT NOW()
+
+,   PRIMARY KEY (table_name, schema_name)
+);
