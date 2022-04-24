@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 )
 
 type Dependency struct {
@@ -34,9 +35,14 @@ func main() {
 	schemaPtr := flag.String("schema", "", "Schema of table to refresh")
 	tablePtr := flag.String("table", "", "Name of table to refresh")
 	tsFieldPtr := flag.String("ts", "", "Comma-seperated list of timestamp fields")
+	spNamePtr := flag.String("sp", "", "Name of the stored procedure used to refresh the table (defaults to refresh_<table_name>)")
+	timeoutSecondsPtr := flag.Int("timeout", 3600, "Maximum seconds to wait for stored procedure to finish")
 	flag.Parse()
 
-	log.Printf("Running refresh with the following parameters: schema = %s, table = %s, tsFields = %s", *schemaPtr, *tablePtr, *tsFieldPtr)
+	log.Printf(
+		"Running refresh with the following parameters: schema = %s, table = %s, tsFields = %s, sp = %s, tiemout = %d",
+		*schemaPtr, *tablePtr, *tsFieldPtr, *spNamePtr, *timeoutSecondsPtr,
+	)
 
 	if *schemaPtr == "" {
 		log.Fatalf("No schema was provided.")
@@ -48,6 +54,13 @@ func main() {
 
 	if *tsFieldPtr == "" {
 		log.Fatalf("No timestamp fields were provided.")
+	}
+
+	var spName string
+	if *spNamePtr == "" {
+		spName = fmt.Sprintf("refresh_%s", *tablePtr)
+	} else {
+		spName = *spNamePtr
 	}
 
 	config := getConfig()
@@ -64,9 +77,14 @@ func main() {
 		log.Println("Connection closed.")
 	}(con, context.Background())
 
+	err = setStatus(con, *schemaPtr, spName, "running")
+	if err != nil {
+		logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the status to idle: %v", err))
+	}
+
 	dependencies, err := getDependenciesForTable(con, *schemaPtr, *tablePtr)
 	if err != nil {
-		log.Fatalf("An error occurred while fetching the dependencies for table, %s: %v", *tablePtr, err)
+		logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while fetching the dependencies for table, %s: %v", *tablePtr, err))
 	}
 
 	dependenciesReadyToUpdate := map[string]bool{}
@@ -80,6 +98,11 @@ func main() {
 
 	if len(dependenciesReadyToUpdate) == 0 {
 		log.Println("There were no dependencies ready to update.")
+
+		err := logSkip(con, *schemaPtr, spName)
+		if err != nil {
+			logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while logging skip for %s.%s: %v", *schemaPtr, spName, err))
+		}
 	} else {
 		log.Println("The following dependencies are ready to be updated:")
 		for dependencyName, _ := range dependenciesReadyToUpdate {
@@ -90,41 +113,45 @@ func main() {
 		for _, dependency := range dependencies {
 			ts, err := getLoad(con, dependency.Schema, dependency.Table, dependency.Field)
 			if err != nil {
-				log.Fatalf("An error occurred while getting the initial load timestamp for %s: %v", dependency.FullName(), err)
+				logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while getting the initial load timestamp for %s: %v", dependency.FullName(), err))
 			}
 			seenTimestamps[dependency.FullName()] = ts
 		}
 
-		err = runStoredProcedure(
+		err = runStoredProcedureWithTimeout(
 			con,
 			*schemaPtr,
-			fmt.Sprintf("refresh_%s", *tablePtr),
+			spName,
 			dependencies,
+			time.Duration(*timeoutSecondsPtr)*time.Second,
 		)
 		if err != nil {
-			log.Fatalf("An error occurred while running the stored procedure: %v", err)
+			logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while running %s.%s: %v", *schemaPtr, spName, err))
 		}
-
-		log.Println("Refresh was successful.")
 
 		for _, tsField := range tsFields {
 			ts, err := getMaxTs(con, *schemaPtr, *tablePtr, tsField)
 			if err != nil {
-				log.Fatalf("An error occurred while getting the maximum timestamp for %s.%s.%s: %v", *schemaPtr, *tablePtr, tsField, err)
+				logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while getting the maximum timestamp for %s.%s.%s: %v", *schemaPtr, *tablePtr, tsField, err))
 			}
 
 			err = setLoad(con, *schemaPtr, *tablePtr, tsField, ts)
 			if err != nil {
-				log.Fatalf("An error occurred while setting the load timestamp for %s.%s.%s: %v", *schemaPtr, *tablePtr, tsField, err)
+				logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the load timestamp for %s.%s.%s: %v", *schemaPtr, *tablePtr, tsField, err))
 			}
 		}
 
 		for _, dependency := range dependencies {
 			err := setSeen(con, *schemaPtr, *tablePtr, dependency.Schema, dependency.Table, dependency.Field, seenTimestamps[dependency.FullName()])
 			if err != nil {
-				log.Fatalf("An error occurred while setting the seen timestamp for %s: %v", dependency.FullName(), err)
+				logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the seen timestamp for %s: %v", dependency.FullName(), err))
 			}
 		}
+	}
+
+	err = setStatus(con, *schemaPtr, spName, "idle")
+	if err != nil {
+		logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the status to idle: %v", err))
 	}
 }
 
@@ -168,8 +195,8 @@ func getDependenciesForTable(
 		,	COALESCE(l.ts, '1900-01-01 00:00:00 +0') AS load
 		,	COALESCE(d.seen, '1900-01-01 00:00:00 +0') AS seen
 		,	COALESCE(l.ts, '1900-01-01 00:00:00 +0') > COALESCE(d.seen, '1900-01-01 00:00:00 +0') AS stale
-		FROM etl.dependency AS d
-		LEFT JOIN etl.load AS l 
+		FROM dvr.dependency AS d
+		LEFT JOIN dvr.load AS l 
 			ON d.dependency_schema_name = l.schema_name
 			AND d.dependency_table_name = l.table_name
 			AND d.dependency_field_name = l.field_name
@@ -179,7 +206,6 @@ func getDependenciesForTable(
 		ORDER BY 
 			1, 2, 3
 	`
-
 	rows, err := con.Query(context.Background(), sql, schema, table)
 	if err != nil {
 		return []Dependency{}, err
@@ -252,7 +278,7 @@ func getLoad(
 		SELECT MAX(t2.ts) AS ts
 		FROM (
 			SELECT t.ts
-			FROM etl.load AS t
+			FROM dvr.load AS t
 			WHERE
 				t.schema_name = $1
 				AND t.table_name = $2
@@ -282,7 +308,7 @@ func getSeen(
 		SELECT MAX(t2.ts) AS ts
 		FROM (
 			SELECT t.seen AS ts
-			FROM etl.dependency AS t
+			FROM dvr.dependency AS t
 			WHERE
 				t.schema_name = $1
 				AND t.table_name = $2
@@ -302,6 +328,52 @@ func getSeen(
 	}
 
 	return ts, nil
+}
+
+func logError(
+	con *pgx.Conn,
+	schema string,
+	spName string,
+	errorMessage string,
+) {
+	sql := `
+		INSERT INTO dvr.error (
+			schema_name
+		,	sp_name
+		,	error_message
+		,	ts
+		) VALUES (
+			$1
+		,	$2
+		,	$3
+		,	NOW()
+		)
+		ON CONFLICT (sp_name, schema_name)
+		DO UPDATE SET
+			error_message = EXCLUDED.error_message
+		,	ts = NOW()
+	`
+	_, err := con.Exec(context.Background(), sql, schema, spName, errorMessage)
+	if err != nil {
+		log.Fatalf("An error occurred while logging error to dvr.error: %v\nOriginal error message: %s", err, errorMessage)
+	}
+
+	log.Fatalf(errorMessage)
+}
+
+func logSkip(con *pgx.Conn, schema string, spName string) error {
+	sql := `
+		INSERT INTO dvr.skip (schema_name, sp_name)
+		VALUES ($1, $2)
+		ON CONFLICT (sp_name, schema_name) 
+		DO UPDATE SET ts = NOW()
+	`
+	_, err := con.Exec(context.Background(), sql, schema, spName)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func runStoredProcedure(
@@ -327,12 +399,98 @@ func runStoredProcedure(
 
 	log.Printf("Running %s", sql)
 
+	start := time.Now()
+
 	_, err := con.Exec(context.Background(), sql, params...)
 	if err != nil {
 		return fmt.Errorf(
 			"runStoredProcedure(con: ..., schema: %s, spName: %s, dependencies: %v, %s: %v",
 			schema, spName, dependencies, sql, err,
 		)
+	}
+
+	elapsedMillis := time.Since(start).Milliseconds()
+
+	err = setElapsedMillis(con, schema, spName, elapsedMillis)
+	if err != nil {
+		return fmt.Errorf(
+			"logElapsedMillis(con: ..., schema: %s, spName: %s, elapsedMillis: %v): %v",
+			schema, spName, elapsedMillis, err,
+		)
+	}
+
+	return nil
+}
+
+func runStoredProcedureWithTimeout(
+	con *pgx.Conn,
+	schema string,
+	spName string,
+	dependencies []Dependency,
+	timeoutSeconds time.Duration,
+) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*timeoutSeconds)
+	defer cancel()
+
+	done := make(chan error, 1)
+	panicChan := make(chan interface{}, 1)
+	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				panicChan <- p
+			}
+		}()
+
+		done <- runStoredProcedure(
+			con,
+			schema,
+			spName,
+			dependencies,
+		)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func setElapsedMillis(con *pgx.Conn, schema string, spName string, millis int64) error {
+	sql := `
+		INSERT INTO dvr.execution_time (
+			schema_name
+		,	sp_name
+		,	ct
+		,	millis
+		,	latest_millis
+		,	max_millis
+		,	min_millis
+		,	ts
+		) 
+		VALUES (
+			$1
+		,	$2
+		,	1
+		,	$3
+		,	$3
+		,	$3
+		,	$3
+		,	NOW()
+		)
+		ON CONFLICT (sp_name, schema_name)
+		DO UPDATE SET
+			ct = dvr.execution_time.ct + 1
+		,	millis = dvr.execution_time.millis + EXCLUDED.millis
+		,	latest_millis = EXCLUDED.latest_millis
+		,	min_millis = CASE WHEN EXCLUDED.millis < dvr.execution_time.min_millis THEN EXCLUDED.millis ELSE dvr.execution_time.min_millis END
+		,	max_millis = CASE WHEN EXCLUDED.millis > dvr.execution_time.max_millis THEN EXCLUDED.millis ELSE dvr.execution_time.max_millis END
+		,	ts = NOW()
+	`
+	_, err := con.Exec(context.Background(), sql, schema, spName, millis)
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -346,7 +504,7 @@ func setLoad(
 	ts pgtype.Timestamptz,
 ) error {
 	updateSQL := `
-		INSERT INTO etl.load (
+		INSERT INTO dvr.load (
 			schema_name
 		,	table_name
 		,	field_name
@@ -361,8 +519,7 @@ func setLoad(
 		DO UPDATE SET
 			ts = EXCLUDED.ts
 		WHERE
-			etl.load.ts IS DISTINCT FROM EXCLUDED.ts
-		;
+			dvr.load.ts IS DISTINCT FROM EXCLUDED.ts
 	`
 	_, err := con.Exec(context.Background(), updateSQL, schema, table, field, ts)
 	if err != nil {
@@ -382,7 +539,7 @@ func setSeen(
 	ts pgtype.Timestamptz,
 ) error {
 	sql := `
-		UPDATE etl.dependency AS d 
+		UPDATE dvr.dependency AS d 
 		SET 
 			seen = $1
 		WHERE
@@ -392,8 +549,33 @@ func setSeen(
 			AND d.dependency_field_name = $5
 			AND d.dependency_schema_name = $6
 	`
-
 	_, err := con.Exec(context.Background(), sql, ts, table, schema, dependencyTable, dependencyField, dependencySchema)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func setStatus(con *pgx.Conn, schema string, spName string, status string) error {
+	sql := `
+		INSERT INTO dvr.status (
+			schema_name
+		,	sp_name
+		,	status 
+		,	ts
+		) VALUES (
+			$1
+		,	$2
+		,	$3
+		,	NOW()
+		)
+		ON CONFLICT (sp_name, schema_name) 
+		DO UPDATE SET 
+			status = EXCLUDED.status
+		,	ts = NOW()
+	`
+	_, err := con.Exec(context.Background(), sql, schema, spName, status)
 	if err != nil {
 		return err
 	}
