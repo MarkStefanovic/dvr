@@ -77,14 +77,18 @@ func main() {
 		log.Println("Connection closed.")
 	}(con, context.Background())
 
-	err = setStatus(con, *schemaPtr, spName, "running")
+	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(*timeoutSecondsPtr)*time.Second)
+	defer cancel()
+
+	err = setStatus(ctx, con, *schemaPtr, spName, "running")
 	if err != nil {
-		logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the status to idle: %v", err))
+		logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the status to idle: %v", err))
 	}
 
-	dependencies, err := getDependenciesForTable(con, *schemaPtr, *tablePtr)
+	dependencies, err := getDependenciesForTable(ctx, con, *schemaPtr, *tablePtr)
 	if err != nil {
-		logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while fetching the dependencies for table, %s: %v", *tablePtr, err))
+		logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while fetching the dependencies for table, %s: %v", *tablePtr, err))
 	}
 
 	dependenciesReadyToUpdate := map[string]bool{}
@@ -99,9 +103,9 @@ func main() {
 	if len(dependenciesReadyToUpdate) == 0 {
 		log.Println("There were no dependencies ready to update.")
 
-		err := logSkip(con, *schemaPtr, spName)
+		err := logSkip(ctx, con, *schemaPtr, spName)
 		if err != nil {
-			logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while logging skip for %s.%s: %v", *schemaPtr, spName, err))
+			logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while logging skip for %s.%s: %v", *schemaPtr, spName, err))
 		}
 	} else {
 		log.Println("The following dependencies are ready to be updated:")
@@ -111,47 +115,47 @@ func main() {
 
 		seenTimestamps := map[string]pgtype.Timestamptz{}
 		for _, dependency := range dependencies {
-			ts, err := getLoad(con, dependency.Schema, dependency.Table, dependency.Field)
+			ts, err := getLoad(ctx, con, dependency.Schema, dependency.Table, dependency.Field)
 			if err != nil {
-				logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while getting the initial load timestamp for %s: %v", dependency.FullName(), err))
+				logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while getting the initial load timestamp for %s: %v", dependency.FullName(), err))
 			}
 			seenTimestamps[dependency.FullName()] = ts
 		}
 
-		err = runStoredProcedureWithTimeout(
+		err = runStoredProcedure(
+			ctx,
 			con,
 			*schemaPtr,
 			spName,
 			dependencies,
-			time.Duration(*timeoutSecondsPtr)*time.Second,
 		)
 		if err != nil {
-			logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while running %s.%s: %v", *schemaPtr, spName, err))
+			logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while running %s.%s: %v", *schemaPtr, spName, err))
 		}
 
 		for _, tsField := range tsFields {
-			ts, err := getMaxTs(con, *schemaPtr, *tablePtr, tsField)
+			ts, err := getMaxTs(ctx, con, *schemaPtr, *tablePtr, tsField)
 			if err != nil {
-				logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while getting the maximum timestamp for %s.%s.%s: %v", *schemaPtr, *tablePtr, tsField, err))
+				logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while getting the maximum timestamp for %s.%s.%s: %v", *schemaPtr, *tablePtr, tsField, err))
 			}
 
-			err = setLoad(con, *schemaPtr, *tablePtr, tsField, ts)
+			err = setLoad(ctx, con, *schemaPtr, *tablePtr, tsField, ts)
 			if err != nil {
-				logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the load timestamp for %s.%s.%s: %v", *schemaPtr, *tablePtr, tsField, err))
+				logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the load timestamp for %s.%s.%s: %v", *schemaPtr, *tablePtr, tsField, err))
 			}
 		}
 
 		for _, dependency := range dependencies {
-			err := setSeen(con, *schemaPtr, *tablePtr, dependency.Schema, dependency.Table, dependency.Field, seenTimestamps[dependency.FullName()])
+			err := setSeen(ctx, con, *schemaPtr, *tablePtr, dependency.Schema, dependency.Table, dependency.Field, seenTimestamps[dependency.FullName()])
 			if err != nil {
-				logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the seen timestamp for %s: %v", dependency.FullName(), err))
+				logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the seen timestamp for %s: %v", dependency.FullName(), err))
 			}
 		}
 	}
 
-	err = setStatus(con, *schemaPtr, spName, "idle")
+	err = setStatus(ctx, con, *schemaPtr, spName, "idle")
 	if err != nil {
-		logError(con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the status to idle: %v", err))
+		logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the status to idle: %v", err))
 	}
 }
 
@@ -183,6 +187,7 @@ func getConfig() map[string]interface{} {
 }
 
 func getDependenciesForTable(
+	ctx context.Context,
 	con *pgx.Conn,
 	schema string,
 	table string,
@@ -206,7 +211,7 @@ func getDependenciesForTable(
 		ORDER BY 
 			1, 2, 3
 	`
-	rows, err := con.Query(context.Background(), sql, schema, table)
+	rows, err := con.Query(ctx, sql, schema, table)
 	if err != nil {
 		return []Dependency{}, err
 	}
@@ -245,7 +250,13 @@ func getDependenciesForTable(
 	return dependencies, nil
 }
 
-func getMaxTs(con *pgx.Conn, schema string, table string, field string) (pgtype.Timestamptz, error) {
+func getMaxTs(
+	ctx context.Context,
+	con *pgx.Conn,
+	schema string,
+	table string,
+	field string,
+) (pgtype.Timestamptz, error) {
 	sql := fmt.Sprintf(
 		`
 			SELECT MAX(t2.ts) AS ts
@@ -260,7 +271,7 @@ func getMaxTs(con *pgx.Conn, schema string, table string, field string) (pgtype.
 		`, field, schema, table,
 	)
 	var ts pgtype.Timestamptz
-	err := con.QueryRow(context.Background(), sql).Scan(&ts)
+	err := con.QueryRow(ctx, sql).Scan(&ts)
 	if err != nil {
 		return pgtype.Timestamptz{}, err
 	}
@@ -269,6 +280,7 @@ func getMaxTs(con *pgx.Conn, schema string, table string, field string) (pgtype.
 }
 
 func getLoad(
+	ctx context.Context,
 	con *pgx.Conn,
 	schema string,
 	table string,
@@ -290,39 +302,7 @@ func getLoad(
 		) AS t2
 	`
 	var ts pgtype.Timestamptz
-	err := con.QueryRow(context.Background(), sql, schema, table, field).Scan(&ts)
-	if err != nil {
-		return pgtype.Timestamptz{}, err
-	}
-
-	return ts, nil
-}
-
-func getSeen(
-	con *pgx.Conn,
-	schema string,
-	table string,
-	dependency Dependency,
-) (pgtype.Timestamptz, error) {
-	sql := `
-		SELECT MAX(t2.ts) AS ts
-		FROM (
-			SELECT t.seen AS ts
-			FROM dvr.dependency AS t
-			WHERE
-				t.schema_name = $1
-				AND t.table_name = $2
-				AND t.dependency_schema_name = $3
-				AND t.dependency_table_name = $4
-				AND t.dependency_field_name = $5
-	
-			UNION ALL
-		
-			SELECT '1900-01-01 00:00:00 +0'::TIMESTAMPTZ(0) AS ts
-		) AS t2
-	`
-	var ts pgtype.Timestamptz
-	err := con.QueryRow(context.Background(), sql, schema, table, dependency.Schema, dependency.Table, dependency.Field).Scan(&ts)
+	err := con.QueryRow(ctx, sql, schema, table, field).Scan(&ts)
 	if err != nil {
 		return pgtype.Timestamptz{}, err
 	}
@@ -331,6 +311,7 @@ func getSeen(
 }
 
 func logError(
+	ctx context.Context,
 	con *pgx.Conn,
 	schema string,
 	spName string,
@@ -353,7 +334,7 @@ func logError(
 			error_message = EXCLUDED.error_message
 		,	ts = NOW()
 	`
-	_, err := con.Exec(context.Background(), sql, schema, spName, errorMessage)
+	_, err := con.Exec(ctx, sql, schema, spName, errorMessage)
 	if err != nil {
 		log.Fatalf("An error occurred while logging error to dvr.error: %v\nOriginal error message: %s", err, errorMessage)
 	}
@@ -361,14 +342,19 @@ func logError(
 	log.Fatalf(errorMessage)
 }
 
-func logSkip(con *pgx.Conn, schema string, spName string) error {
+func logSkip(
+	ctx context.Context,
+	con *pgx.Conn,
+	schema string,
+	spName string,
+) error {
 	sql := `
 		INSERT INTO dvr.skip (schema_name, sp_name)
 		VALUES ($1, $2)
 		ON CONFLICT (sp_name, schema_name) 
 		DO UPDATE SET ts = NOW()
 	`
-	_, err := con.Exec(context.Background(), sql, schema, spName)
+	_, err := con.Exec(ctx, sql, schema, spName)
 	if err != nil {
 		return err
 	}
@@ -377,6 +363,7 @@ func logSkip(con *pgx.Conn, schema string, spName string) error {
 }
 
 func runStoredProcedure(
+	ctx context.Context,
 	con *pgx.Conn,
 	schema string,
 	spName string,
@@ -401,7 +388,7 @@ func runStoredProcedure(
 
 	start := time.Now()
 
-	_, err := con.Exec(context.Background(), sql, params...)
+	_, err := con.Exec(ctx, sql, params...)
 	if err != nil {
 		return fmt.Errorf(
 			"runStoredProcedure(con: ..., schema: %s, spName: %s, dependencies: %v, %s: %v",
@@ -411,7 +398,7 @@ func runStoredProcedure(
 
 	elapsedMillis := time.Since(start).Milliseconds()
 
-	err = setElapsedMillis(con, schema, spName, elapsedMillis)
+	err = setElapsedMillis(ctx, con, schema, spName, elapsedMillis)
 	if err != nil {
 		return fmt.Errorf(
 			"logElapsedMillis(con: ..., schema: %s, spName: %s, elapsedMillis: %v): %v",
@@ -422,42 +409,13 @@ func runStoredProcedure(
 	return nil
 }
 
-func runStoredProcedureWithTimeout(
+func setElapsedMillis(
+	ctx context.Context,
 	con *pgx.Conn,
 	schema string,
 	spName string,
-	dependencies []Dependency,
-	timeoutSeconds time.Duration,
+	millis int64,
 ) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*timeoutSeconds)
-	defer cancel()
-
-	done := make(chan error, 1)
-	panicChan := make(chan interface{}, 1)
-	go func() {
-		defer func() {
-			if p := recover(); p != nil {
-				panicChan <- p
-			}
-		}()
-
-		done <- runStoredProcedure(
-			con,
-			schema,
-			spName,
-			dependencies,
-		)
-	}()
-
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func setElapsedMillis(con *pgx.Conn, schema string, spName string, millis int64) error {
 	sql := `
 		INSERT INTO dvr.execution_time (
 			schema_name
@@ -488,7 +446,7 @@ func setElapsedMillis(con *pgx.Conn, schema string, spName string, millis int64)
 		,	max_millis = CASE WHEN EXCLUDED.millis > dvr.execution_time.max_millis THEN EXCLUDED.millis ELSE dvr.execution_time.max_millis END
 		,	ts = NOW()
 	`
-	_, err := con.Exec(context.Background(), sql, schema, spName, millis)
+	_, err := con.Exec(ctx, sql, schema, spName, millis)
 	if err != nil {
 		return err
 	}
@@ -497,6 +455,7 @@ func setElapsedMillis(con *pgx.Conn, schema string, spName string, millis int64)
 }
 
 func setLoad(
+	ctx context.Context,
 	con *pgx.Conn,
 	schema string,
 	table string,
@@ -521,7 +480,7 @@ func setLoad(
 		WHERE
 			dvr.load.ts IS DISTINCT FROM EXCLUDED.ts
 	`
-	_, err := con.Exec(context.Background(), updateSQL, schema, table, field, ts)
+	_, err := con.Exec(ctx, updateSQL, schema, table, field, ts)
 	if err != nil {
 		return err
 	}
@@ -530,6 +489,7 @@ func setLoad(
 }
 
 func setSeen(
+	ctx context.Context,
 	con *pgx.Conn,
 	schema string,
 	table string,
@@ -549,7 +509,7 @@ func setSeen(
 			AND d.dependency_field_name = $5
 			AND d.dependency_schema_name = $6
 	`
-	_, err := con.Exec(context.Background(), sql, ts, table, schema, dependencyTable, dependencyField, dependencySchema)
+	_, err := con.Exec(ctx, sql, ts, table, schema, dependencyTable, dependencyField, dependencySchema)
 	if err != nil {
 		return err
 	}
@@ -557,7 +517,13 @@ func setSeen(
 	return nil
 }
 
-func setStatus(con *pgx.Conn, schema string, spName string, status string) error {
+func setStatus(
+	ctx context.Context,
+	con *pgx.Conn,
+	schema string,
+	spName string,
+	status string,
+) error {
 	sql := `
 		INSERT INTO dvr.status (
 			schema_name
@@ -575,7 +541,7 @@ func setStatus(con *pgx.Conn, schema string, spName string, status string) error
 			status = EXCLUDED.status
 		,	ts = NOW()
 	`
-	_, err := con.Exec(context.Background(), sql, schema, spName, status)
+	_, err := con.Exec(ctx, sql, schema, spName, status)
 	if err != nil {
 		return err
 	}
