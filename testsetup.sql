@@ -29,6 +29,8 @@ BEGIN
     RAISE NOTICE 'p_dv_h_customer_ts: %', p_dv_h_customer_ts;
     RAISE NOTICE 'p_sales_customer_date_added: %', p_sales_customer_date_added;
     RAISE NOTICE 'p_sales_customer_date_updated: %', p_sales_customer_date_updated;
+
+    PERFORM pg_sleep(10);
 END;
 $$;
 CALL dv.refresh_s_customer_sales();
