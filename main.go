@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"github.com/jackc/pgtype"
 	"github.com/jackc/pgx/v4"
+	"github.com/kjk/dailyrotate"
 	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -32,6 +34,19 @@ func init() {
 }
 
 func main() {
+	fh, err := openLogFile()
+	if err != nil {
+		log.Fatalf("openLogFile failed: %v", err)
+	}
+	defer func(fh *dailyrotate.File) {
+		err := fh.Close()
+		if err != nil {
+			log.Fatalf("An error occurred while closing the log file: %v", err)
+		}
+	}(fh)
+
+	log.SetOutput(fh)
+
 	schemaPtr := flag.String("schema", "", "Schema of table to refresh")
 	tablePtr := flag.String("table", "", "Name of table to refresh")
 	tsFieldPtr := flag.String("ts", "", "Comma-seperated list of timestamp fields")
@@ -83,12 +98,18 @@ func main() {
 
 	err = setStatus(ctx, con, *schemaPtr, spName, "running")
 	if err != nil {
-		logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the status to idle: %v", err))
+		logError(
+			ctx, con, *schemaPtr, spName,
+			fmt.Sprintf("An error occurred while setting the status to idle: %v", err),
+		)
 	}
 
 	dependencies, err := getDependenciesForTable(ctx, con, *schemaPtr, *tablePtr)
 	if err != nil {
-		logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while fetching the dependencies for table, %s: %v", *tablePtr, err))
+		logError(
+			ctx, con, *schemaPtr, spName,
+			fmt.Sprintf("An error occurred while fetching the dependencies for table, %s: %v", *tablePtr, err),
+		)
 	}
 
 	dependenciesReadyToUpdate := map[string]bool{}
@@ -105,11 +126,14 @@ func main() {
 
 		err := logSkip(ctx, con, *schemaPtr, spName)
 		if err != nil {
-			logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while logging skip for %s.%s: %v", *schemaPtr, spName, err))
+			logError(
+				ctx, con, *schemaPtr, spName,
+				fmt.Sprintf("An error occurred while logging skip for %s.%s: %v", *schemaPtr, spName, err),
+			)
 		}
 	} else {
 		log.Println("The following dependencies are ready to be updated:")
-		for dependencyName, _ := range dependenciesReadyToUpdate {
+		for dependencyName := range dependenciesReadyToUpdate {
 			log.Printf("- %s", dependencyName)
 		}
 
@@ -117,7 +141,10 @@ func main() {
 		for _, dependency := range dependencies {
 			ts, err := getLoad(ctx, con, dependency.Schema, dependency.Table, dependency.Field)
 			if err != nil {
-				logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while getting the initial load timestamp for %s: %v", dependency.FullName(), err))
+				logError(
+					ctx, con, *schemaPtr, spName,
+					fmt.Sprintf("An error occurred while getting the initial load timestamp for %s: %v", dependency.FullName(), err),
+				)
 			}
 			seenTimestamps[dependency.FullName()] = ts
 		}
@@ -130,32 +157,47 @@ func main() {
 			dependencies,
 		)
 		if err != nil {
-			logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while running %s.%s: %v", *schemaPtr, spName, err))
+			logError(
+				ctx, con, *schemaPtr, spName,
+				fmt.Sprintf("An error occurred while running %s.%s: %v", *schemaPtr, spName, err),
+			)
 		}
 
 		for _, tsField := range tsFields {
 			ts, err := getMaxTs(ctx, con, *schemaPtr, *tablePtr, tsField)
 			if err != nil {
-				logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while getting the maximum timestamp for %s.%s.%s: %v", *schemaPtr, *tablePtr, tsField, err))
+				logError(
+					ctx, con, *schemaPtr, spName,
+					fmt.Sprintf("An error occurred while getting the maximum timestamp for %s.%s.%s: %v", *schemaPtr, *tablePtr, tsField, err),
+				)
 			}
 
 			err = setLoad(ctx, con, *schemaPtr, *tablePtr, tsField, ts)
 			if err != nil {
-				logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the load timestamp for %s.%s.%s: %v", *schemaPtr, *tablePtr, tsField, err))
+				logError(
+					ctx, con, *schemaPtr, spName,
+					fmt.Sprintf("An error occurred while setting the load timestamp for %s.%s.%s: %v", *schemaPtr, *tablePtr, tsField, err),
+				)
 			}
 		}
 
 		for _, dependency := range dependencies {
 			err := setSeen(ctx, con, *schemaPtr, *tablePtr, dependency.Schema, dependency.Table, dependency.Field, seenTimestamps[dependency.FullName()])
 			if err != nil {
-				logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the seen timestamp for %s: %v", dependency.FullName(), err))
+				logError(
+					ctx, con, *schemaPtr, spName,
+					fmt.Sprintf("An error occurred while setting the seen timestamp for %s: %v", dependency.FullName(), err),
+				)
 			}
 		}
 	}
 
 	err = setStatus(ctx, con, *schemaPtr, spName, "idle")
 	if err != nil {
-		logError(ctx, con, *schemaPtr, spName, fmt.Sprintf("An error occurred while setting the status to idle: %v", err))
+		logError(
+			ctx, con, *schemaPtr, spName,
+			fmt.Sprintf("An error occurred while setting the status to idle: %v", err),
+		)
 	}
 }
 
@@ -178,7 +220,7 @@ func getConfig() map[string]interface{} {
 	}
 
 	var result map[string]interface{}
-	err = json.Unmarshal([]byte(byteValue), &result)
+	err = json.Unmarshal(byteValue, &result)
 	if err != nil {
 		log.Fatalf("An error occurred while unmarshalling config.json: %v", err)
 	}
@@ -360,6 +402,31 @@ func logSkip(
 	}
 
 	return nil
+}
+
+func onLogClose(path string, didRotate bool) {
+	fmt.Printf("closed file '%s', didRotate: %v\n", path, didRotate)
+	if !didRotate {
+		return
+	}
+}
+
+func openLogFile() (*dailyrotate.File, error) {
+	logDir := "logs"
+
+	// ensure folder exists
+	err := os.MkdirAll(logDir, 0755)
+	if err != nil {
+		log.Fatalf("os.MkdirAll(): %v", err)
+	}
+
+	pathFormat := filepath.Join(logDir, "2006-01-02.txt")
+
+	fileHandle, err := dailyrotate.NewFile(pathFormat, onLogClose)
+	if err != nil {
+		return nil, err
+	}
+	return fileHandle, nil
 }
 
 func runStoredProcedure(
