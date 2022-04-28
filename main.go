@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -53,7 +54,7 @@ func main() {
 	flag.Parse()
 
 	log.Printf(
-		"Running refresh with the following parameters: schema = %s, table = %s, tsFields = %s, sp = %s, tiemout = %d",
+		"Running refresh with the following parameters: schema = %s, table = %s, tsFields = %s, sp = %s, timeout = %d",
 		*schemaPtr, *tablePtr, *tsFieldPtr, *spNamePtr, *timeoutSecondsPtr,
 	)
 
@@ -130,10 +131,10 @@ func main() {
 			)
 		}
 	} else {
-		log.Println("The following dependencies are ready to be updated:")
-		for dependencyName := range dependenciesReadyToUpdate {
-			log.Printf("- %s", dependencyName)
-		}
+		log.Printf(
+			"The following dependencies are ready to be updated: %v",
+			reflect.ValueOf(dependenciesReadyToUpdate).MapKeys(),
+		)
 
 		seenTimestamps := map[string]pgtype.Timestamptz{}
 		for _, dependency := range dependencies {
@@ -253,7 +254,10 @@ func getDependenciesForTable(
 	`
 	rows, err := con.Query(ctx, sql, schema, table)
 	if err != nil {
-		return []Dependency{}, err
+		return []Dependency{}, fmt.Errorf(
+			"con.Query(ctx: ..., sql: %s, schema: %s, table: %s): %v",
+			sql, schema, table, err,
+		)
 	}
 	defer rows.Close()
 
@@ -273,7 +277,7 @@ func getDependenciesForTable(
 			&seen,
 			&stale,
 		); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("rows.Scan(...): %v", err)
 		}
 
 		dependency := Dependency{
@@ -313,7 +317,7 @@ func getMaxTs(
 	var ts pgtype.Timestamptz
 	err := con.QueryRow(ctx, sql).Scan(&ts)
 	if err != nil {
-		return pgtype.Timestamptz{}, err
+		return pgtype.Timestamptz{}, fmt.Errorf("con.QueryRow(ctx: ..., sql: %s).Scan(&ts): %v", sql, err)
 	}
 
 	return ts, nil
@@ -345,7 +349,7 @@ func getLoad(
 	err := con.QueryRow(ctx, sql, schema, table, field).Scan(&ts)
 	if err != nil {
 		return pgtype.Timestamptz{}, fmt.Errorf(
-			"getLoad con.QueryRow(ctx: ..., sql: %s, schema: %s, table: %s, field: %s).Scan(&ts): %v",
+			"con.QueryRow(ctx: ..., sql: %s, schema: %s, table: %s, field: %s).Scan(&ts): %v",
 			sql, schema, table, field, err,
 		)
 	}
@@ -379,7 +383,10 @@ func logError(
 	`
 	_, err := con.Exec(ctx, sql, schema, spName, errorMessage)
 	if err != nil {
-		log.Fatalf("An error occurred while logging error to dvr.error: %v\nOriginal error message: %s", err, errorMessage)
+		log.Fatalf(
+			"An error occurred while logging error to dvr.error, con.Exec(ctx: ..., sql: %s, schema: %s, spName: %s, errorMessage: %s): %v",
+			sql, schema, spName, errorMessage, err,
+		)
 	}
 
 	log.Fatalf(errorMessage)
@@ -399,7 +406,7 @@ func logSkip(
 	`
 	_, err := con.Exec(ctx, sql, schema, spName)
 	if err != nil {
-		return fmt.Errorf("logSkip con.Exec(ctx: ..., sql: %s, schema: %s, spName: %s): %v", sql, schema, spName, err)
+		return fmt.Errorf("con.Exec(ctx: ..., sql: %s, schema: %s, spName: %s): %v", sql, schema, spName, err)
 	}
 
 	return nil
@@ -409,7 +416,7 @@ func onLogClose(_ string, didRotate bool) {
 	if didRotate {
 		items, err := ioutil.ReadDir("logs")
 		if err != nil {
-			log.Fatalf(`onLogClose ioutil.ReadDir("logs"): %v`, err)
+			log.Fatalf(`ioutil.ReadDir("logs"): %v`, err)
 		}
 
 		dateFormat := "2006-01-02.txt"
@@ -420,14 +427,14 @@ func onLogClose(_ string, didRotate bool) {
 				if err == nil && r {
 					dt, err := time.Parse(dateFormat, item.Name())
 					if err != nil {
-						log.Fatalf("onLogClose time.Parse(dateFormat: %s, itemName(): %s): %v", dateFormat, item.Name(), err)
+						log.Fatalf("time.Parse(dateFormat: %s, itemName(): %s): %v", dateFormat, item.Name(), err)
 					}
 
 					if time.Now().Sub(dt).Hours() > (7 * 24) {
 						fullPath := filepath.Join("logs", item.Name())
 						err := os.Remove(fullPath)
 						if err != nil {
-							log.Fatalf("onLogClose os.Remove(%s): %v", fullPath, err)
+							log.Fatalf("An error occurred while running onLogClose, os.Remove(%s): %v", fullPath, err)
 						}
 					}
 				}
@@ -448,7 +455,10 @@ func openLogFile() (*dailyrotate.File, error) {
 
 	fileHandle, err := dailyrotate.NewFile(pathFormat, onLogClose)
 	if err != nil {
-		log.Fatalf("openLogFile dailyrotate.NewFile(pathFormat: %s, onLogClose): %v", pathFormat, err)
+		log.Fatalf(
+			"An error occurred while running openLogFile, dailyrotate.NewFile(pathFormat: %s, onLogClose): %v",
+			pathFormat, err,
+		)
 	}
 	return fileHandle, nil
 }
@@ -475,15 +485,13 @@ func runStoredProcedure(
 	sb.WriteString(")")
 	sql := sb.String()
 
-	log.Printf("Running %s", sql)
-
 	start := time.Now()
 
 	_, err := con.Exec(ctx, sql, params...)
 	if err != nil {
 		return fmt.Errorf(
-			"runStoredProcedure(con: ..., schema: %s, spName: %s, dependencies: %v, %s: %v",
-			schema, spName, dependencies, sql, err,
+			"con.Exec(ctx: ..., sql: %s, params: %v...): %v",
+			sql, params, err,
 		)
 	}
 
@@ -492,7 +500,7 @@ func runStoredProcedure(
 	err = setElapsedMillis(ctx, con, schema, spName, elapsedMillis)
 	if err != nil {
 		return fmt.Errorf(
-			"logElapsedMillis(con: ..., schema: %s, spName: %s, elapsedMillis: %v): %v",
+			"setElapsedMillis(ctx: ..., con: ..., schema: %s, spName: %s, elapsedMillis: %d): %v",
 			schema, spName, elapsedMillis, err,
 		)
 	}
@@ -539,7 +547,10 @@ func setElapsedMillis(
 	`
 	_, err := con.Exec(ctx, sql, schema, spName, millis)
 	if err != nil {
-		return err
+		return fmt.Errorf(
+			"con.Exec(ctx: ..., sql: %s, schema: %s, spName: %s, millis: %d): %v",
+			sql, schema, spName, millis, err,
+		)
 	}
 
 	return nil
@@ -553,7 +564,7 @@ func setLoad(
 	field string,
 	ts pgtype.Timestamptz,
 ) error {
-	updateSQL := `
+	sql := `
 		INSERT INTO dvr.load (
 			schema_name
 		,	table_name
@@ -571,9 +582,12 @@ func setLoad(
 		WHERE
 			dvr.load.ts IS DISTINCT FROM EXCLUDED.ts
 	`
-	_, err := con.Exec(ctx, updateSQL, schema, table, field, ts)
+	_, err := con.Exec(ctx, sql, schema, table, field, ts)
 	if err != nil {
-		return err
+		return fmt.Errorf(
+			"con.Exec(ctx: ..., sql: %s, schema: %s, table: %s, field: %s, ts: %v): %v",
+			sql, schema, table, field, ts, err,
+		)
 	}
 
 	return nil
@@ -602,7 +616,10 @@ func setSeen(
 	`
 	_, err := con.Exec(ctx, sql, ts, table, schema, dependencyTable, dependencyField, dependencySchema)
 	if err != nil {
-		return err
+		return fmt.Errorf(
+			"con.Exec(ctx: ..., sql: %s, ts: %v, table: %s, schema: %s, dependencyTable: %s, dependencyField: %s, dependencySchema: %s): %v",
+			sql, ts, table, schema, dependencyTable, dependencyField, dependencySchema, err,
+		)
 	}
 
 	return nil
@@ -634,7 +651,10 @@ func setStatus(
 	`
 	_, err := con.Exec(ctx, sql, schema, spName, status)
 	if err != nil {
-		return err
+		return fmt.Errorf(
+			"con.Exec(ctx: ..., sql: %s, schema: %s, spName: %s, status: %s): %v",
+			sql, schema, spName, status, err,
+		)
 	}
 
 	return nil
