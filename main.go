@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -29,10 +30,6 @@ func (d Dependency) FullName() string {
 	return fmt.Sprintf("%s.%s.%s", d.Schema, d.Table, d.Field)
 }
 
-func init() {
-	log.SetOutput(os.Stdout)
-}
-
 func main() {
 	fh, err := openLogFile()
 	if err != nil {
@@ -46,6 +43,7 @@ func main() {
 	}(fh)
 
 	log.SetOutput(fh)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	schemaPtr := flag.String("schema", "", "Schema of table to refresh")
 	tablePtr := flag.String("table", "", "Name of table to refresh")
@@ -346,7 +344,10 @@ func getLoad(
 	var ts pgtype.Timestamptz
 	err := con.QueryRow(ctx, sql, schema, table, field).Scan(&ts)
 	if err != nil {
-		return pgtype.Timestamptz{}, err
+		return pgtype.Timestamptz{}, fmt.Errorf(
+			"getLoad con.QueryRow(ctx: ..., sql: %s, schema: %s, table: %s, field: %s).Scan(&ts): %v",
+			sql, schema, table, field, err,
+		)
 	}
 
 	return ts, nil
@@ -398,33 +399,56 @@ func logSkip(
 	`
 	_, err := con.Exec(ctx, sql, schema, spName)
 	if err != nil {
-		return err
+		return fmt.Errorf("logSkip con.Exec(ctx: ..., sql: %s, schema: %s, spName: %s): %v", sql, schema, spName, err)
 	}
 
 	return nil
 }
 
-func onLogClose(path string, didRotate bool) {
-	fmt.Printf("closed file '%s', didRotate: %v\n", path, didRotate)
-	if !didRotate {
-		return
+func onLogClose(_ string, didRotate bool) {
+	if didRotate {
+		items, err := ioutil.ReadDir("logs")
+		if err != nil {
+			log.Fatalf(`onLogClose ioutil.ReadDir("logs"): %v`, err)
+		}
+
+		dateFormat := "2006-01-02.txt"
+
+		for _, item := range items {
+			if !item.IsDir() {
+				r, err := regexp.MatchString(`^\d\d\d\d-\d\d-\d\d.txt`, item.Name())
+				if err == nil && r {
+					dt, err := time.Parse(dateFormat, item.Name())
+					if err != nil {
+						log.Fatalf("onLogClose time.Parse(dateFormat: %s, itemName(): %s): %v", dateFormat, item.Name(), err)
+					}
+
+					if time.Now().Sub(dt).Hours() > (7 * 24) {
+						fullPath := filepath.Join("logs", item.Name())
+						err := os.Remove(fullPath)
+						if err != nil {
+							log.Fatalf("onLogClose os.Remove(%s): %v", fullPath, err)
+						}
+					}
+				}
+			}
+		}
 	}
 }
 
 func openLogFile() (*dailyrotate.File, error) {
 	logDir := "logs"
 
-	// ensure folder exists
 	err := os.MkdirAll(logDir, 0755)
 	if err != nil {
-		log.Fatalf("os.MkdirAll(): %v", err)
+		log.Fatalf("openLogFile os.MkdirAll(logDir: %s, 0755): %v", logDir, err)
 	}
 
 	pathFormat := filepath.Join(logDir, "2006-01-02.txt")
 
 	fileHandle, err := dailyrotate.NewFile(pathFormat, onLogClose)
 	if err != nil {
-		return nil, err
+		log.Fatalf("openLogFile dailyrotate.NewFile(pathFormat: %s, onLogClose): %v", pathFormat, err)
 	}
 	return fileHandle, nil
 }
