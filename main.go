@@ -599,22 +599,12 @@ func setLoad(
 	ts pgtype.Timestamptz,
 ) error {
 	sql := `
-		INSERT INTO dvr.load (
-			schema_name
-		,	table_name
-		,	field_name
-		,	ts
-		) VALUES (
-			$1
-		,	$2
-		,	$3
-		,	$4
+		CALL dvr.set_load(
+			p_schema := $1
+		,	p_table := $2
+		,	p_field := $3
+		,	p_ts := $4
 		)
-		ON CONFLICT (schema_name, table_name, field_name)
-		DO UPDATE SET
-			ts = EXCLUDED.ts
-		WHERE
-			dvr.load.ts IS DISTINCT FROM EXCLUDED.ts
 	`
 	_, err := con.Exec(ctx, sql, schema, table, field, ts)
 	if err != nil {
