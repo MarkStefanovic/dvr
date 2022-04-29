@@ -59,3 +59,27 @@ CREATE TABLE IF NOT EXISTS dvr.skip (
 ,   ts TIMESTAMPTZ(0) NOT NULL DEFAULT NOW()
 ,   PRIMARY KEY (sp_name, schema_name)
 );
+
+CREATE OR REPLACE PROCEDURE dvr.set_load(
+    p_schema TEXT
+,   p_table TEXT
+,   p_field TEXT
+,   p_ts TIMESTAMPTZ(0)
+) AS $$
+    INSERT INTO dvr.load (
+        schema_name
+    ,   table_name
+    ,   field_name
+    ,   ts
+    ) VALUES (
+        p_schema
+    ,   p_table
+    ,   p_field
+    ,   COALESCE(p_ts, '1900-01-01 +0')
+    )
+    ON CONFLICT (table_name, schema_name, field_name)
+    DO UPDATE SET
+        ts = EXCLUDED.ts
+    ;
+$$
+LANGUAGE sql;

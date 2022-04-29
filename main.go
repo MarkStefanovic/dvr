@@ -7,13 +7,12 @@ import (
 	"fmt"
 	"github.com/jackc/pgtype"
 	"github.com/jackc/pgx/v4"
-	"github.com/kjk/dailyrotate"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -32,19 +31,7 @@ func (d Dependency) FullName() string {
 }
 
 func main() {
-	fh, err := openLogFile()
-	if err != nil {
-		log.Fatalf("openLogFile failed: %v", err)
-	}
-	defer func(fh *dailyrotate.File) {
-		err := fh.Close()
-		if err != nil {
-			log.Fatalf("An error occurred while closing the log file: %v", err)
-		}
-	}(fh)
-
-	log.SetOutput(fh)
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 
 	schemaPtr := flag.String("schema", "", "Schema of table to refresh")
 	tablePtr := flag.String("table", "", "Name of table to refresh")
@@ -53,21 +40,37 @@ func main() {
 	timeoutSecondsPtr := flag.Int("timeout", 3600, "Maximum seconds to wait for stored procedure to finish")
 	flag.Parse()
 
+	errorFile, err := openLogFile(*schemaPtr, *tablePtr)
+	if err != nil {
+		log.Fatalf("openLogFile failed: %v", err)
+	}
+
+	errorLog := log.New(
+		io.MultiWriter(errorFile, os.Stdout),
+		"ERROR: ",
+		log.Ldate|log.Ltime|log.Lshortfile,
+	)
+
+	err = deleteOldLogs(*schemaPtr, *tablePtr)
+	if err != nil {
+		errorLog.Fatalf("An error occurred while deleting old logs for %s.%s: %v", *schemaPtr, *tablePtr, err)
+	}
+
 	log.Printf(
 		"Running refresh with the following parameters: schema = %s, table = %s, tsFields = %s, sp = %s, timeout = %d",
 		*schemaPtr, *tablePtr, *tsFieldPtr, *spNamePtr, *timeoutSecondsPtr,
 	)
 
 	if *schemaPtr == "" {
-		log.Fatalf("No schema was provided.")
+		errorLog.Fatalf("No schema was provided.")
 	}
 
 	if *tablePtr == "" {
-		log.Fatalf("No table was provided.")
+		errorLog.Fatalf("No table was provided.")
 	}
 
 	if *tsFieldPtr == "" {
-		log.Fatalf("No timestamp fields were provided.")
+		errorLog.Fatalf("No timestamp fields were provided.")
 	}
 
 	var spName string
@@ -81,12 +84,12 @@ func main() {
 
 	con, err := pgx.Connect(context.Background(), config["connection_string"].(string))
 	if err != nil {
-		log.Fatalf("Unable to connect to database: %v", err)
+		errorLog.Fatalf("Unable to connect to database: %v", err)
 	}
 	defer func(conn *pgx.Conn, ctx context.Context) {
 		err := conn.Close(ctx)
 		if err != nil {
-			log.Fatalf("An error occurred while closing the database: %v", err)
+			errorLog.Fatalf("An error occurred while closing the database: %v", err)
 		}
 		log.Println("Connection closed.")
 	}(con, context.Background())
@@ -98,7 +101,7 @@ func main() {
 	err = setStatus(ctx, con, *schemaPtr, spName, "running")
 	if err != nil {
 		logError(
-			ctx, con, *schemaPtr, spName,
+			ctx, con, *schemaPtr, spName, errorLog,
 			fmt.Sprintf("An error occurred while setting the status to idle: %v", err),
 		)
 	}
@@ -106,7 +109,7 @@ func main() {
 	dependencies, err := getDependenciesForTable(ctx, con, *schemaPtr, *tablePtr)
 	if err != nil {
 		logError(
-			ctx, con, *schemaPtr, spName,
+			ctx, con, *schemaPtr, spName, errorLog,
 			fmt.Sprintf("An error occurred while fetching the dependencies for table, %s: %v", *tablePtr, err),
 		)
 	}
@@ -126,13 +129,16 @@ func main() {
 		err := logSkip(ctx, con, *schemaPtr, spName)
 		if err != nil {
 			logError(
-				ctx, con, *schemaPtr, spName,
-				fmt.Sprintf("An error occurred while logging skip for %s.%s: %v", *schemaPtr, spName, err),
+				ctx, con, *schemaPtr, spName, errorLog,
+				fmt.Sprintf(
+					"An error occurred while logging skip for %s.%s: %v",
+					*schemaPtr, spName, err,
+				),
 			)
 		}
 	} else {
 		log.Printf(
-			"The following dependencies are ready to be updated: %v",
+			"The following dependencies have been updated since the last refresh: %v",
 			reflect.ValueOf(dependenciesReadyToUpdate).MapKeys(),
 		)
 
@@ -141,8 +147,11 @@ func main() {
 			ts, err := getLoad(ctx, con, dependency.Schema, dependency.Table, dependency.Field)
 			if err != nil {
 				logError(
-					ctx, con, *schemaPtr, spName,
-					fmt.Sprintf("An error occurred while getting the initial load timestamp for %s: %v", dependency.FullName(), err),
+					ctx, con, *schemaPtr, spName, errorLog,
+					fmt.Sprintf(
+						"An error occurred while getting the initial load timestamp for %s: %v",
+						dependency.FullName(), err,
+					),
 				)
 			}
 			seenTimestamps[dependency.FullName()] = ts
@@ -157,7 +166,7 @@ func main() {
 		)
 		if err != nil {
 			logError(
-				ctx, con, *schemaPtr, spName,
+				ctx, con, *schemaPtr, spName, errorLog,
 				fmt.Sprintf("An error occurred while running %s.%s: %v", *schemaPtr, spName, err),
 			)
 		}
@@ -166,26 +175,44 @@ func main() {
 			ts, err := getMaxTs(ctx, con, *schemaPtr, *tablePtr, tsField)
 			if err != nil {
 				logError(
-					ctx, con, *schemaPtr, spName,
-					fmt.Sprintf("An error occurred while getting the maximum timestamp for %s.%s.%s: %v", *schemaPtr, *tablePtr, tsField, err),
+					ctx, con, *schemaPtr, spName, errorLog,
+					fmt.Sprintf(
+						"An error occurred while getting the maximum timestamp for %s.%s.%s: %v",
+						*schemaPtr, *tablePtr, tsField, err,
+					),
 				)
 			}
 
 			err = setLoad(ctx, con, *schemaPtr, *tablePtr, tsField, ts)
 			if err != nil {
 				logError(
-					ctx, con, *schemaPtr, spName,
-					fmt.Sprintf("An error occurred while setting the load timestamp for %s.%s.%s: %v", *schemaPtr, *tablePtr, tsField, err),
+					ctx, con, *schemaPtr, spName, errorLog,
+					fmt.Sprintf(
+						"An error occurred while setting the load timestamp for %s.%s.%s: %v",
+						*schemaPtr, *tablePtr, tsField, err,
+					),
 				)
 			}
 		}
 
 		for _, dependency := range dependencies {
-			err := setSeen(ctx, con, *schemaPtr, *tablePtr, dependency.Schema, dependency.Table, dependency.Field, seenTimestamps[dependency.FullName()])
+			err := setSeen(
+				ctx,
+				con,
+				*schemaPtr,
+				*tablePtr,
+				dependency.Schema,
+				dependency.Table,
+				dependency.Field,
+				seenTimestamps[dependency.FullName()],
+			)
 			if err != nil {
 				logError(
-					ctx, con, *schemaPtr, spName,
-					fmt.Sprintf("An error occurred while setting the seen timestamp for %s: %v", dependency.FullName(), err),
+					ctx, con, *schemaPtr, spName, errorLog,
+					fmt.Sprintf(
+						"An error occurred while setting the seen timestamp for %s: %v",
+						dependency.FullName(), err,
+					),
 				)
 			}
 		}
@@ -194,10 +221,41 @@ func main() {
 	err = setStatus(ctx, con, *schemaPtr, spName, "idle")
 	if err != nil {
 		logError(
-			ctx, con, *schemaPtr, spName,
+			ctx, con, *schemaPtr, spName, errorLog,
 			fmt.Sprintf("An error occurred while setting the status to idle: %v", err),
 		)
 	}
+}
+
+func deleteOldLogs(schema string, table string) error {
+	items, err := ioutil.ReadDir("logs")
+	if err != nil {
+		return fmt.Errorf(`ioutil.ReadDir("logs"): %v`, err)
+	}
+
+	dateFormat := "2006-01-02"
+
+	filePrefix := schema + "." + table
+
+	for _, item := range items {
+		if !item.IsDir() && strings.HasPrefix(item.Name(), filePrefix) && strings.HasSuffix(item.Name(), ".txt") {
+			dateStr := item.Name()[len(filePrefix)+1 : len(item.Name())-4]
+			dt, err := time.Parse(dateFormat, dateStr)
+			if err != nil {
+				return fmt.Errorf("time.Parse(dateFormat: %s, itemName(): %s): %v", dateFormat, item.Name(), err)
+			}
+			if time.Now().Sub(dt).Hours() > (7 * 24) {
+				fullPath := filepath.Join("logs", item.Name())
+				err := os.Remove(fullPath)
+				if err != nil {
+					return fmt.Errorf("os.Remove(%s): %v", fullPath, err)
+				}
+				log.Printf("Deleted %s.", fullPath)
+			}
+		}
+	}
+
+	return nil
 }
 
 func getConfig() map[string]interface{} {
@@ -362,6 +420,7 @@ func logError(
 	con *pgx.Conn,
 	schema string,
 	spName string,
+	fileLogger *log.Logger,
 	errorMessage string,
 ) {
 	sql := `
@@ -383,13 +442,13 @@ func logError(
 	`
 	_, err := con.Exec(ctx, sql, schema, spName, errorMessage)
 	if err != nil {
-		log.Fatalf(
+		fileLogger.Fatalf(
 			"An error occurred while logging error to dvr.error, con.Exec(ctx: ..., sql: %s, schema: %s, spName: %s, errorMessage: %s): %v",
 			sql, schema, spName, errorMessage, err,
 		)
 	}
 
-	log.Fatalf(errorMessage)
+	fileLogger.Fatalf(errorMessage)
 }
 
 func logSkip(
@@ -412,55 +471,22 @@ func logSkip(
 	return nil
 }
 
-func onLogClose(_ string, didRotate bool) {
-	if didRotate {
-		items, err := ioutil.ReadDir("logs")
-		if err != nil {
-			log.Fatalf(`ioutil.ReadDir("logs"): %v`, err)
-		}
-
-		dateFormat := "2006-01-02.txt"
-
-		for _, item := range items {
-			if !item.IsDir() {
-				r, err := regexp.MatchString(`^\d\d\d\d-\d\d-\d\d.txt`, item.Name())
-				if err == nil && r {
-					dt, err := time.Parse(dateFormat, item.Name())
-					if err != nil {
-						log.Fatalf("time.Parse(dateFormat: %s, itemName(): %s): %v", dateFormat, item.Name(), err)
-					}
-
-					if time.Now().Sub(dt).Hours() > (7 * 24) {
-						fullPath := filepath.Join("logs", item.Name())
-						err := os.Remove(fullPath)
-						if err != nil {
-							log.Fatalf("An error occurred while running onLogClose, os.Remove(%s): %v", fullPath, err)
-						}
-					}
-				}
-			}
-		}
-	}
-}
-
-func openLogFile() (*dailyrotate.File, error) {
+func openLogFile(schema string, table string) (*os.File, error) {
 	logDir := "logs"
 
 	err := os.MkdirAll(logDir, 0755)
 	if err != nil {
-		log.Fatalf("openLogFile os.MkdirAll(logDir: %s, 0755): %v", logDir, err)
+		return nil, fmt.Errorf("os.MkdirAll(logDir: %s, 0755): %v", logDir, err)
 	}
 
-	pathFormat := filepath.Join(logDir, "2006-01-02.txt")
+	fp := filepath.Join(logDir, fmt.Sprintf("%s.%s.%s.txt", schema, table, time.Now().Format("2006-01-02")))
 
-	fileHandle, err := dailyrotate.NewFile(pathFormat, onLogClose)
+	fh, err := os.OpenFile(fp, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
-		log.Fatalf(
-			"An error occurred while running openLogFile, dailyrotate.NewFile(pathFormat: %s, onLogClose): %v",
-			pathFormat, err,
-		)
+		return nil, fmt.Errorf("os.OpenFile(fp: %s, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666): %v", fp, err)
 	}
-	return fileHandle, nil
+
+	return fh, nil
 }
 
 func runStoredProcedure(
@@ -541,8 +567,16 @@ func setElapsedMillis(
 			ct = dvr.execution_time.ct + 1
 		,	millis = dvr.execution_time.millis + EXCLUDED.millis
 		,	latest_millis = EXCLUDED.latest_millis
-		,	min_millis = CASE WHEN EXCLUDED.millis < dvr.execution_time.min_millis THEN EXCLUDED.millis ELSE dvr.execution_time.min_millis END
-		,	max_millis = CASE WHEN EXCLUDED.millis > dvr.execution_time.max_millis THEN EXCLUDED.millis ELSE dvr.execution_time.max_millis END
+		,	min_millis = 
+				CASE 
+					WHEN EXCLUDED.millis < dvr.execution_time.min_millis THEN EXCLUDED.millis 
+					ELSE dvr.execution_time.min_millis 
+				END
+		,	max_millis = 
+				CASE 
+					WHEN EXCLUDED.millis > dvr.execution_time.max_millis THEN EXCLUDED.millis 
+					ELSE dvr.execution_time.max_millis 
+				END
 		,	ts = NOW()
 	`
 	_, err := con.Exec(ctx, sql, schema, spName, millis)
