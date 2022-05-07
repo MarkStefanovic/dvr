@@ -238,7 +238,7 @@ func deleteOldLogs(schema string, table string) error {
 	filePrefix := schema + "." + table
 
 	for _, item := range items {
-		if !item.IsDir() && strings.HasPrefix(item.Name(), filePrefix) && strings.HasSuffix(item.Name(), ".txt") {
+		if !item.IsDir() && strings.HasPrefix(item.Name(), filePrefix+".") && strings.HasSuffix(item.Name(), ".txt") {
 			dateStr := item.Name()[len(filePrefix)+1 : len(item.Name())-4]
 			dt, err := time.Parse(dateFormat, dateStr)
 			if err != nil {
