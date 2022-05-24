@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/jackc/pgtype"
-	"github.com/jackc/pgx/v4"
 	"io"
 	"io/ioutil"
 	"log"
@@ -15,6 +13,9 @@ import (
 	"reflect"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgtype"
+	"github.com/jackc/pgx/v4"
 )
 
 type Dependency struct {
@@ -51,7 +52,7 @@ func main() {
 		log.Ldate|log.Ltime|log.Lshortfile,
 	)
 
-	err = deleteOldLogs(*schemaPtr, *tablePtr)
+	err = deleteOldLogs()
 	if err != nil {
 		errorLog.Fatalf("An error occurred while deleting old logs for %s.%s: %v", *schemaPtr, *tablePtr, err)
 	}
@@ -227,7 +228,7 @@ func main() {
 	}
 }
 
-func deleteOldLogs(schema string, table string) error {
+func deleteOldLogs() error {
 	items, err := ioutil.ReadDir("logs")
 	if err != nil {
 		return fmt.Errorf(`ioutil.ReadDir("logs"): %v`, err)
@@ -235,16 +236,15 @@ func deleteOldLogs(schema string, table string) error {
 
 	dateFormat := "2006-01-02"
 
-	filePrefix := schema + "." + table
-
 	for _, item := range items {
-		if !item.IsDir() && strings.HasPrefix(item.Name(), filePrefix) && strings.HasSuffix(item.Name(), ".txt") {
-			dateStr := item.Name()[len(filePrefix)+1 : len(item.Name())-4]
-			dt, err := time.Parse(dateFormat, dateStr)
+		if !item.IsDir() && strings.HasSuffix(item.Name(), ".txt") {
+			dateStr := strings.Split(item.Name(), ".")[2]
+			date, err := time.Parse(dateFormat, dateStr)
 			if err != nil {
 				return fmt.Errorf("time.Parse(dateFormat: %s, itemName(): %s): %v", dateFormat, item.Name(), err)
 			}
-			if time.Now().Sub(dt).Hours() > (7 * 24) {
+			// only keep the last 3 days of logs
+			if time.Since(date).Hours() > (3 * 24) {
 				fullPath := filepath.Join("logs", item.Name())
 				err := os.Remove(fullPath)
 				if err != nil {
